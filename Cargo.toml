@@ -9,6 +9,9 @@ rust-version = "1.99.1"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Veysel440/vana"
 
+[workspace.dependencies]
+proptest = { version = "1.12", default-features = false, features = ["std"] }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

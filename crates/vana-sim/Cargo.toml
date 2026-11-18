@@ -11,5 +11,8 @@ publish = false
 [dependencies]
 vana-core = { path = "../vana-core" }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true

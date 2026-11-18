@@ -6,14 +6,27 @@ reach PHP, in what order, and how many at a time.
 
 ## Status
 
-Pre-alpha. Nothing works yet: the repository contains the workspace skeleton,
-CI configuration and design notes.
+Pre-alpha. vana does not run as a proxy yet. The decision library and the
+simulator exist; the HTTP layer does not.
+
+| Part | State | Phase |
+|---|---|---|
+| Time, tickets, permits (`vana-core`) | built | 1 |
+| Fixed limiter (`vana-core`) | built | 1 |
+| Deterministic simulator with a fixed limit (`vana-sim`) | built | 1 |
+| Queue, priority classes, per-tenant Deficit Round Robin | planned | 1 |
+| Deadline-based early rejection | planned | 1 |
+| HTTP/1.1 reverse proxy | planned | 2 |
+| AIMD and Gradient2 limiters, PHP-FPM status limiter | planned | 3 |
+| Shadow mode, Prometheus metrics, structured logs, graceful shutdown | planned | not yet assigned |
+| "What-if" simulation from access logs | planned | not yet assigned |
+| Lab and comparative measurements | planned | 4 |
 
 ## Planned features
 
 - HTTP/1.1 reverse proxy.
-- Concurrency limits on requests sent to PHP: Fixed, AIMD and Gradient2, plus a
-  limit driven by the PHP-FPM status page.
+- Concurrency limits on requests sent to PHP: AIMD and Gradient2, plus a
+  limit driven by the PHP-FPM status page (the Fixed limit is built).
 - Priority classes, with fair queuing between tenants inside each class
   (Deficit Round Robin).
 - Early rejection (503 with `Retry-After`) of requests that cannot finish
