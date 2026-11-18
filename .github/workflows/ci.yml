@@ -27,6 +27,9 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Test (release)
+        run: cargo test --workspace --locked --release
+
       - name: Docs
         run: cargo doc --workspace --no-deps --locked
         env:

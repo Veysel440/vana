@@ -1,9 +1,10 @@
 # vana design notes
 
 Status: draft. Section 8 describes what `vana-core` and `vana-sim` provide at
-this commit: time, tickets, permits, a fixed limiter and a deterministic
-simulator. The proxy, the queue, the scheduler, the adaptive limiters and
-priority classes are not implemented yet; the other sections describe the
+this commit: time, tickets, permits, a fixed limiter, a bounded FIFO queue
+with deadline-aware admission (the gate), and a deterministic simulator. The
+proxy, the scheduler (priority classes and per-tenant fairness) and the
+adaptive limiters are not implemented yet; the other sections describe the
 design. Points that are still open are marked `TODO:`.
 
 ## 1. Problem
@@ -101,10 +102,14 @@ classify -> admit -> queue -> limit -> upstream -> feedback
 2. **admit**: decide whether to accept the request at all. A request whose
    deadline cannot be met is rejected here with 503 and `Retry-After`.
    TODO: how the expected wait is estimated.
-3. **queue**: an admitted request waits in the scheduler.
+3. **queue**: an admitted request waits in the scheduler. The gate (section 8)
+   already provides a bounded FIFO queue; priority classes and per-tenant DRR
+   are planned.
 4. **limit**: the scheduler releases the next request only when the limiter
    grants a permit. The deadline is checked again at this point, so an expired
-   request is never sent (I3). TODO: the response an expired request gets.
+   request is never sent (I3). The gate does this when a ticket reaches the
+   head of the queue and when `expire` runs. TODO: the response an expired
+   request gets.
 5. **upstream**: the request is forwarded to the PHP application.
 6. **feedback**: when the upstream exchange ends, the permit is released: the
    slot is freed and a latency sample goes to the limiter.
@@ -122,10 +127,14 @@ classify -> admit -> queue -> limit -> upstream -> feedback
   slot silently (the limiter's `in_flight` stays too high). TODO: how the
   limiter treats samples from errors and client disconnects. TODO: how a
   dropped permit is handled in release builds once the HTTP layer cancels
-  requests (a guard type that releases on drop, or a leak counter).
+  requests (a guard type that releases on drop, or a leak counter). This is
+  deferred to Phase 2, where the request guard type is designed.
+- **Gate**: a bounded FIFO queue in front of a limiter, with deadline-aware
+  admission. Built (section 8).
 - **Scheduler**: priority classes, DRR between the tenants inside each class,
-  and aging so that low-priority requests are not starved. TODO: the cost unit
-  used by DRR (one per request, or weighted).
+  and aging so that low-priority requests are not starved. Planned: the gate's
+  queue is plain FIFO. TODO: the cost unit used by DRR (one per request, or
+  weighted).
 - **Limiter**: a trait that answers "how many requests may be in flight now"
   and grants permits. Built: Fixed. Planned: AIMD, Gradient2 and the PHP-FPM
   status limiter.
@@ -183,9 +192,72 @@ This section describes the code at this commit.
   `in_flight` is 0 panics in debug builds with "release called on a limiter
   with no permit in flight"; in release builds `in_flight` stays at 0.
 - TODO: whether `Permit` carries a limiter id, so that a release to the
-  wrong limiter is caught.
+  wrong limiter is caught. Deferred until the adaptive limiter is added.
 - TODO: I1 under a dropping limit cannot be tested with `FixedLimiter`; it is
   tested once an adaptive limiter exists.
+
+### Gate
+
+`Gate<L: Limiter>` puts a bounded FIFO queue in front of a limiter and
+decides, for each ticket, whether it runs now, waits or is turned away. It
+derives `Debug` when `L` does. It only holds tickets; it never reads a clock,
+so every method takes `now`.
+
+- A ticket is expired at time `t` when its deadline is at most `t`
+  (`deadline <= t`). A ticket without a deadline never expires.
+- The queue is FIFO by submission order. A new ticket never overtakes a
+  queued one, and tickets leave the queue for a permit in the order they
+  arrived. This is a rule, not a numbered invariant; the tests check it.
+- Types: `RejectReason` is `QueueFull` or `Expired` (`Clone`, `Copy`,
+  `Debug`, `PartialEq`, `Eq`). `Admission` is `Granted(Ticket, Permit)`,
+  `Queued` or `Rejected(Ticket, RejectReason)`. `Dequeued` is
+  `Granted(Ticket, Permit)` or `Expired(Ticket)`. Both derive `Debug`.
+- `Gate::new(limiter, queue_capacity)`: a capacity of 0 means no queue.
+  `limiter()` returns the limiter, `queued()` the number of queued tickets,
+  `next_deadline()` the earliest deadline among the queued tickets (`None`
+  when the queue is empty or no queued ticket has a deadline).
+- `submit(ticket, now) -> Admission` (`#[must_use]`), in this order:
+  1. An expired ticket is `Rejected(Expired)`, also when the queue is full.
+  2. If the queue is empty and the limiter grants a permit, the ticket is
+     `Granted`.
+  3. Otherwise, if `queued < queue_capacity`, the ticket is `Queued`;
+     if not, it is `Rejected(QueueFull)`.
+- `release(permit, now, outcome) -> Vec<Dequeued>` (`#[must_use]`) releases
+  the permit to the limiter, then drains the queue from the head:
+  - an expired head is dropped and returned as `Expired`;
+  - an unexpired head gets a permit if the limiter has room and is returned
+    as `Granted`;
+  - the drain stops at the first unexpired head the limiter cannot take, or
+    when the queue is empty. That head keeps its place. Expired heads behind
+    the last grant are still dropped, because the drain only stops at an
+    unexpired head the limiter cannot take.
+  - The results are in the order they happened.
+  - A ticket granted from the queue gets `acquired_at` equal to the release
+    time `now`, not its arrival time.
+- `expire(now) -> Vec<Ticket>` (`#[must_use]`) removes every expired ticket,
+  wherever it is in the queue, and returns them in queue order. The other
+  tickets keep their order.
+- An expired ticket that is not at the head stays in the queue and counts
+  against `queue_capacity` until `expire` runs (or it reaches the head in a
+  `release`). `submit` does not remove it. A caller that wants them out of
+  the way calls `expire` before `submit`; the simulator does.
+- I3 and I8 hold after every public method (section 9).
+- TODO: `submit` does not remove expired tickets when the queue is full, so a
+  full queue of expired tickets rejects a live ticket with `QueueFull` until
+  `expire` runs. Open question: should `submit` purge expired tickets first
+  when the queue is full?
+- TODO: a queued ticket cannot be removed when its client goes away. The
+  queue keeps it until it is granted or expires. Phase 2, when the HTTP
+  layer cancels requests.
+- TODO: with a fixed limit, the limit cannot rise without a release, so
+  `release` is the only drain. Once a limit can rise without a release (the
+  adaptive limiter), the empty-queue check in `submit` and a drain besides
+  `release` must be tested, and I8 must hold after that drain too.
+- TODO: `next_deadline` and `expire` scan the whole queue on every call.
+  Nothing is measured; revisit when the scheduler (DRR) replaces the plain
+  queue.
+- TODO: an upper bound for `queue_capacity`, to be set with the configuration
+  (Phase 2). The core accepts any `u32`.
 
 ### SplitMix64
 
@@ -209,6 +281,12 @@ This section describes the code at this commit.
   `ticket`, `tenant` and `in_flight`. `to_json_line` and `to_json_lines`
   print traces.
 - The same scenario gives the same trace, byte for byte (I7).
+- `run_gate(&GateScenario) -> Result<Vec<GateEvent>, ScenarioError>` runs the
+  same kind of traffic against a `Gate` in front of a `FixedLimiter`.
+  `GateScenario` has `seed`, `requests`, `tenants`, `limit`, `queue_capacity`,
+  `timeout` (`Option<Nanos>`), `mean_gap` and `mean_service`. `GateEvent` is
+  `Arrive`, `Grant`, `Queue`, `Reject { reason }`, `Expire` or `Release`.
+  `gate_json_lines` prints a trace. See "gate run" below.
 
 ### simulation rules
 
@@ -254,7 +332,76 @@ first that is 0, also when `requests` is 0:
 | `mean_gap` | `ZeroMeanGap` | mean_gap must be at least 1 ns |
 | `mean_service` | `ZeroMeanService` | mean_service must be at least 1 ns |
 
-`requests` = 0 is valid and returns an empty trace.
+`requests` = 0 is valid and returns an empty trace. `run_gate` returns the
+same errors, checked in the same order (see "gate run").
+
+### gate run
+
+`run_gate` drives a `Gate` with the traffic of `run_fixed` and records what
+the gate decides.
+
+- Validation is the same as for `run_fixed` and in the same order: `limit`,
+  `tenants`, `mean_gap`, `mean_service`; the first that is 0 gives its
+  `ScenarioError`, also when `requests` is 0. `queue_capacity` of 0 and a
+  `timeout` of 0 are valid. `requests` = 0 gives an empty trace.
+- Ticket numbers, tenants and the draws of each ticket are as in
+  "simulation rules": first the gap, then the service time. A rejected or
+  expired ticket still draws its service time.
+- Each event has `t`, `ticket`, `tenant`, `in_flight` and `queued`. `Reject`
+  also has `reason`.
+
+#### gate run rules
+
+1. The deadline of a ticket is its arrival plus `timeout`, saturating. When
+   `timeout` is `None`, tickets have no deadline.
+2. Time moves to `t`, the smallest of: the earliest completion time of a
+   running request, the earliest deadline in the queue (`next_deadline`), and
+   the next arrival time. The run ends when no such time is left, that is,
+   when every ticket has ended.
+3. At `t`, in this order:
+   1. Every running request with completion time at most `t` is released, in
+      order of completion time and then ticket, each at its own completion
+      time `done`: a `Release` event, then the events for the tickets the gate
+      moved out of the queue, in the order the gate returned them: `Expire`
+      for an expired ticket, `Grant` for a granted one. A ticket granted from
+      the queue completes at `done` plus its own service time. A completion
+      created at `t` in this part (possible only when time saturates at
+      `Nanos::MAX`) is released in the same part.
+   2. `expire(t)` removes the tickets that expired in the queue; each gets an
+      `Expire` event, in queue order.
+   3. If a ticket arrives at `t`: an `Arrive` event, then `submit` at `t`
+      gives a `Grant`, `Queue` or `Reject` event. At most one ticket arrives
+      per round. If several arrivals fall on the same `t` (possible only at
+      `Nanos::MAX`), each takes one round.
+4. `in_flight` and `queued` are the values after the event is applied, one
+   event at a time. Inside the batch that follows a `Release`, they change
+   event by event: `Release` lowers `in_flight` by 1; each `Expire` lowers
+   `queued` by 1; each `Grant` from the queue lowers `queued` by 1 and raises
+   `in_flight` by 1. `Arrive` changes neither value.
+5. The same `GateScenario` always produces the same trace (I7).
+
+I8 holds after each public gate operation. In a trace, the rows between two
+operations can show a state where `queued` is above 0 while `in_flight` is
+below `limit` (inside a release batch, after the `Release` row), so I8 is
+checked at the last row of each group of rows that share a time `t`.
+
+With `queue_capacity` 0 and `timeout` `None`, the decisions equal those of
+`run_fixed`: there are no `Queue` or `Expire` events and `queued` is always 0.
+The trace of `run_fixed` has no `queued` field and no `Queue` or `Expire`
+events, so the two traces are equal as a projection on `t`, `ev`, `ticket`,
+`tenant` and `in_flight`. `run_gate` lines always carry `queued`, and a
+`reject` line keeps its `reason` (`queue_full`).
+
+#### gate JSON line
+
+One event is one line with no spaces, keys in this order:
+
+```text
+{"t":<u64>,"ev":"arrive|grant|queue|reject|expire|release","ticket":<u64>,"tenant":<u64>,"in_flight":<u32>,"queued":<u32>}
+```
+
+A `reject` line ends with `,"reason":"queue_full|expired"` before the closing
+brace. `gate_json_lines` joins events, and every line ends with `\n`.
 
 ## 9. Invariants
 
@@ -269,7 +416,9 @@ only recorded.
   released exactly once, including when the client disconnects; a ticket that
   ends before it receives a permit never receives one. In debug builds, a
   permit that is dropped without release panics.
-- **I3**: A request whose deadline has passed is never sent upstream.
+- **I3**: A ticket whose deadline has passed (deadline <= now) is never
+  granted: submit rejects it, and the gate drops it from the queue when it
+  reaches the head or when expire runs.
 - **I4**: Within a class, every waiting tenant is served within a bounded
   number of rounds; no tenant starves.
 - **I5**: Thanks to aging, a low-priority request does not wait without bound.
@@ -277,6 +426,14 @@ only recorded.
 - **I6**: The limit always stays within `[min, max]`.
 - **I7**: Given the same seed and the same input, a simulation run produces the
   same result.
+- **I8**: The gate is work-conserving: after every public operation, if a
+  ticket is queued, the limiter is full. In a trace, I8 holds at the last row
+  of each group of rows with the same time (see "gate run rules"). With a
+  fixed limit it is tested; once a limit can rise without a release, a drain
+  besides `release` is needed (see "Gate").
+
+Rule, not an invariant: the queue is FIFO. Tickets that leave the queue for a
+permit do so in the order they arrived; the tests check it.
 
 ## 10. Testing strategy
 

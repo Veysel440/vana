@@ -134,7 +134,8 @@ pub fn to_json_lines(events: &[TraceEvent]) -> String {
     out
 }
 
-/// Error returned when a [`FixedScenario`] is invalid.
+/// Error returned when a [`FixedScenario`] or a [`GateScenario`](crate::GateScenario) is
+/// invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScenarioError {
     /// `limit` was 0.

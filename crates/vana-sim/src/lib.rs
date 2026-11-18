@@ -7,9 +7,11 @@
 //! same trace, byte for byte.
 
 mod clock;
+mod gate_scenario;
 mod rng;
 mod scenario;
 
 pub use clock::ManualClock;
+pub use gate_scenario::{GateEvent, GateScenario, gate_json_lines, run_gate};
 pub use rng::SplitMix64;
 pub use scenario::{FixedScenario, ScenarioError, TraceEvent, run_fixed, to_json_lines};

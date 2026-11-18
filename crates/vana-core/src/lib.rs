@@ -2,19 +2,22 @@
 //!
 //! This crate holds the pure decision logic that sits between a request and a
 //! PHP backend. Today it provides time ([`Nanos`], [`Clock`]), identifiers
-//! ([`TenantId`], [`TicketId`]), [`Ticket`], [`Permit`] and the [`Limiter`]
-//! trait with one implementation, [`FixedLimiter`].
+//! ([`TenantId`], [`TicketId`]), [`Ticket`], [`Permit`], the [`Limiter`]
+//! trait with one implementation, [`FixedLimiter`], and the [`Gate`]: a
+//! bounded FIFO queue in front of a limiter that rejects expired tickets.
 //!
 //! Rule: no I/O, no async runtime, no clock reads. Time is passed in by the
 //! caller as [`Nanos`], so the proxy and the simulator (`vana-sim`) can drive
 //! the same code.
 
+mod gate;
 mod id;
 mod limiter;
 mod permit;
 mod ticket;
 mod time;
 
+pub use gate::{Admission, Dequeued, Gate, RejectReason};
 pub use id::{TenantId, TicketId};
 pub use limiter::{FixedLimiter, LimitError, Limiter, Outcome};
 pub use permit::Permit;
