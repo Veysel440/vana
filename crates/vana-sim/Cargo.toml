@@ -1,0 +1,15 @@
+[package]
+name = "vana-sim"
+description = "Virtual-time simulator for the vana decision engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+vana-core = { path = "../vana-core" }
+
+[lints]
+workspace = true
